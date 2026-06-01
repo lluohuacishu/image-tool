@@ -1,0 +1,42 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# PyInstaller temporary files
+*.manifest
+*.toc
+*.pkg
+
+# Local app data
+*.log
+image_tool_gui.log
+image_tool_settings.json
+
+# Generated image output folders
+compressed_output/
+*_output/
+output/
+exports/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Test and cache folders
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
