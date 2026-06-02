@@ -5,8 +5,11 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
+from output_naming import OutputNaming, build_output_path
+from output_safety import commit_temporary_output, remove_file_silently, temporary_output_path
 
-MAX_CONVERSION_IMAGE_PIXELS = 500_000_000
+
+MAX_CONVERSION_IMAGE_PIXELS = 150_000_000
 MAX_COE_IMAGE_PIXELS = 4_000_000
 
 SUPPORTED_EXPORT_FORMATS = (
@@ -164,9 +167,42 @@ def prepare_for_format(image: Image.Image, target_format: str) -> Image.Image:
     return image.copy()
 
 
-def save_regular_image(image: Image.Image, target: Path, target_format: str) -> None:
-    target_format = target_format.lower()
+def metadata_save_kwargs(
+    image: Image.Image,
+    keep_metadata: bool,
+    target_format: str | None = None,
+) -> dict[str, object]:
+    if not keep_metadata:
+        return {}
+
+    target_format = (target_format or "").lower()
     save_kwargs: dict[str, object] = {}
+    exif = image.getexif()
+    if exif and target_format in {"jpg", "jpeg", "png", "webp", "tif", "tiff"}:
+        save_kwargs["exif"] = exif.tobytes()
+    elif "exif" in image.info and target_format in {"jpg", "jpeg", "png", "webp", "tif", "tiff"}:
+        save_kwargs["exif"] = image.info["exif"]
+    if target_format in {"jpg", "jpeg", "png", "webp", "tif", "tiff"}:
+        for key in ("icc_profile", "dpi"):
+            if key in image.info:
+                save_kwargs[key] = image.info[key]
+    return save_kwargs
+
+
+def copy_metadata_info(target: Image.Image, source: Image.Image) -> None:
+    for key in ("exif", "icc_profile", "dpi"):
+        if key in source.info:
+            target.info[key] = source.info[key]
+
+
+def save_regular_image(
+    image: Image.Image,
+    target: Path,
+    target_format: str,
+    keep_metadata: bool = False,
+) -> None:
+    target_format = target_format.lower()
+    save_kwargs = metadata_save_kwargs(image, keep_metadata, target_format)
 
     if target_format in {"jpg", "jpeg"}:
         save_format = "JPEG"
@@ -233,23 +269,48 @@ def convert_image_file(
     output_dir: Path,
     target_format: str,
     coe_pixel_format: str = "rgb565",
+    naming: OutputNaming | None = None,
+    keep_metadata: bool = False,
 ) -> ConvertResult:
     target_format = target_format.lower()
     if target_format not in SUPPORTED_EXPORT_FORMATS:
         raise ValueError(f"暂不支持输出格式：{target_format}")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    target = unique_conversion_path(output_dir, source, target_format)
+    target = output_dir / f"{source.stem}.{target_format}"
+    temp_target: Path | None = None
+    try:
+        with Image.open(source) as opened:
+            ensure_pixel_limit(opened.size, MAX_CONVERSION_IMAGE_PIXELS, "转换")
+            image = ImageOps.exif_transpose(opened)
+            original_size = image.size
+            suffix = f".{target_format}"
+            if target_format == "jpg":
+                suffix = ".jpg"
+            source_suffix = source.suffix.lower()
+            legacy_stem = source.stem if source_suffix != suffix else f"{source.stem}_converted"
+            target = build_output_path(
+                output_dir,
+                source,
+                suffix,
+                "converted",
+                target_format,
+                image.size,
+                naming,
+                legacy_stem,
+            )
+            temp_target = temporary_output_path(target)
 
-    with Image.open(source) as opened:
-        ensure_pixel_limit(opened.size, MAX_CONVERSION_IMAGE_PIXELS, "转换")
-        image = ImageOps.exif_transpose(opened)
-        original_size = image.size
+            if target_format == "coe":
+                save_coe(image, temp_target, coe_pixel_format)
+            else:
+                prepared = prepare_for_format(image, target_format)
+                copy_metadata_info(prepared, image)
+                save_regular_image(prepared, temp_target, target_format, keep_metadata)
 
-        if target_format == "coe":
-            save_coe(image, target, coe_pixel_format)
-        else:
-            prepared = prepare_for_format(image, target_format)
-            save_regular_image(prepared, target, target_format)
+        target = commit_temporary_output(temp_target, target)
+    except Exception:
+        if temp_target is not None:
+            remove_file_silently(temp_target)
+        raise
 
     return ConvertResult(source, target, original_size, target_format)

@@ -16,16 +16,26 @@ from image_tool_core import (
     readable_error,
 )
 from image_transform import save_transformed_image
+from output_naming import OutputNaming
 
 
 logger = logging.getLogger("image_tool_gui")
 
 
 class CropRotateEditor:
-    def __init__(self, app: Any, source: Path, output_dir: Path) -> None:
+    def __init__(
+        self,
+        app: Any,
+        source: Path,
+        output_dir: Path,
+        naming: OutputNaming | None = None,
+        keep_metadata: bool = False,
+    ) -> None:
         self.app = app
         self.source = source
         self.output_dir = output_dir
+        self.naming = naming
+        self.keep_metadata = keep_metadata
         self.rotation_degrees = 0
         self.crop_box: tuple[int, int, int, int] | None = None
         self.drag_start: tuple[int, int] | None = None
@@ -267,6 +277,8 @@ class CropRotateEditor:
                 self.output_dir,
                 rotation_degrees=self.rotation_degrees,
                 crop_box=self.crop_box,
+                naming=self.naming,
+                keep_metadata=self.keep_metadata,
             )
         except Exception as exc:
             self.app.write_log(f"裁切/旋转失败 {self.source}: {readable_error(exc)}")

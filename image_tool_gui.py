@@ -22,6 +22,7 @@ from image_conversion import (
     same_target_format_sources,
 )
 from image_tool_core import (
+    MAX_IMPORTED_IMAGE_FILES,
     clamp,
     collect_image_paths,
     is_image_file,
@@ -31,6 +32,7 @@ from image_tool_core import (
     readable_error,
     resize_image_file,
 )
+from output_naming import OutputNaming, validate_output_template
 from image_transparency import EDGE_CLEANUP_LEVELS, create_transparent_image_file
 
 
@@ -132,6 +134,9 @@ def load_config() -> dict[str, object]:
         except Exception:
             logger.exception("读取设置失败：%s", path)
             continue
+        if not isinstance(config, dict):
+            logger.warning("忽略无效设置文件：%s", path)
+            continue
         if should_migrate_legacy_log_dir(config.get("log_dir")):
             config["log_dir"] = str(DEFAULT_LOG_DIR)
         return config
@@ -156,7 +161,13 @@ class ImageToolApp:
         self.config = load_config()
         self.files: list[Path] = []
         self.checked_paths: set[Path] = set()
+        self.source_roots: dict[Path, Path] = {}
         self.output_dir = tk.StringVar(value=str(self.config.get("output_dir", "")))
+        self.naming_template = tk.StringVar(value=str(self.config.get("naming_template", "")))
+        self.preserve_structure = tk.BooleanVar(
+            value=bool(self.config.get("preserve_structure", False))
+        )
+        self.keep_metadata = tk.BooleanVar(value=bool(self.config.get("keep_metadata", False)))
         self.percent = tk.IntVar(value=50)
         self.include_subfolders = tk.BooleanVar(
             value=bool(self.config.get("include_subfolders", False))
@@ -170,6 +181,11 @@ class ImageToolApp:
         self.compression_level = tk.StringVar(value=str(self.config.get("compression_level", "中度")))
         if self.compression_level.get() not in COMPRESSION_LEVELS:
             self.compression_level.set("中度")
+        try:
+            target_size_kb = int(self.config.get("target_size_kb", 0))
+        except (TypeError, ValueError):
+            target_size_kb = 0
+        self.target_size_kb = tk.IntVar(value=max(0, min(target_size_kb, 1_000_000)))
         try:
             transparency_tolerance = int(self.config.get("transparency_tolerance", 10))
         except (TypeError, ValueError):
@@ -197,6 +213,7 @@ class ImageToolApp:
         self.processing = False
         self.scanning = False
         self.closing = False
+        self.cancel_requested = threading.Event()
         self.updating_select_all = False
 
         self.colors = {
@@ -619,12 +636,31 @@ class ImageToolApp:
             state="readonly",
             width=14,
         ).grid(row=0, column=1, sticky="w")
+
+        target_size_row = ttk.Frame(self.compress_controls, style="AltPanel.TFrame")
+        target_size_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        target_size_row.columnconfigure(1, weight=1)
+        ttk.Label(
+            target_size_row,
+            text="目标体积 KB",
+            style="AltMuted.TLabel",
+            font=(self.font_family, 10, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        self.target_size_spin = ttk.Spinbox(
+            target_size_row,
+            from_=0,
+            to=1000000,
+            width=12,
+            textvariable=self.target_size_kb,
+            justify="center",
+        )
+        self.target_size_spin.grid(row=0, column=1, sticky="w")
         self.compression_note_label = ttk.Label(
             self.compress_controls,
-            text="轻度更保清晰，中度平衡，重度更小；PNG/TIFF 会优先无损优化。",
+            text="目标体积填 0 时按档位压缩；填入 KB 后，JPEG/WebP 会自动调整质量，其他格式会尽量无损优化。",
             style="AltMuted.TLabel",
         )
-        self.compression_note_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self.compression_note_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         self.transform_controls = ttk.Frame(scale_box, style="AltPanel.TFrame")
         self.transform_controls.grid(row=5, column=0, sticky="ew", pady=(12, 0))
@@ -758,13 +794,15 @@ class ImageToolApp:
         action_bar = ttk.Frame(parent, style="Panel.TFrame")
         action_bar.grid(row=4, column=0, sticky="ew", pady=(16, 0))
         action_bar.columnconfigure(0, weight=1)
+        action_bar.columnconfigure(1, weight=1)
+        action_bar.columnconfigure(2, weight=1)
 
         self.output_summary_label = ttk.Label(
             action_bar,
             text="输出：未设置",
             style="Muted.TLabel",
         )
-        self.output_summary_label.grid(row=0, column=0, sticky="w", columnspan=2, pady=(0, 8))
+        self.output_summary_label.grid(row=0, column=0, sticky="w", columnspan=3, pady=(0, 8))
 
         self.progress = ttk.Progressbar(
             action_bar,
@@ -772,7 +810,7 @@ class ImageToolApp:
             mode="determinate",
             style="Horizontal.TProgressbar",
         )
-        self.progress.grid(row=1, column=0, sticky="ew", columnspan=2, pady=(0, 12))
+        self.progress.grid(row=1, column=0, sticky="ew", columnspan=3, pady=(0, 12))
 
         self.start_button = ttk.Button(
             action_bar,
@@ -782,12 +820,21 @@ class ImageToolApp:
         )
         self.start_button.grid(row=2, column=0, sticky="ew", padx=(0, 8))
 
+        self.cancel_button = ttk.Button(
+            action_bar,
+            text="取消任务",
+            style="Soft.TButton",
+            command=self.cancel_processing,
+            state=tk.DISABLED,
+        )
+        self.cancel_button.grid(row=2, column=1, sticky="ew", padx=8)
+
         ttk.Button(
             action_bar,
             text="打开输出目录",
             style="Soft.TButton",
             command=self.open_output_dir,
-        ).grid(row=2, column=1, sticky="ew", padx=(8, 0))
+        ).grid(row=2, column=2, sticky="ew", padx=(8, 0))
         self.update_output_summary()
 
     def build_preview(self, parent: ttk.Frame) -> None:
@@ -946,19 +993,51 @@ class ImageToolApp:
 
     def process_import_paths(self, paths: list[Path], include_subfolders: bool, source: str) -> None:
         image_paths: list[Path] = []
+        root_map: dict[Path, Path] = {}
         error_text: str | None = None
         try:
-            image_paths = collect_image_paths(paths, include_subfolders)
+            image_paths = collect_image_paths(
+                paths,
+                include_subfolders,
+                max_images=MAX_IMPORTED_IMAGE_FILES,
+            )
+            root_map = self.build_source_root_map(image_paths, paths)
         except Exception as exc:
             error_text = readable_error(exc)
             logger.exception("扫描图片失败")
 
-        self.run_on_ui_thread(self.on_import_scan_finished, image_paths, source, error_text)
+        self.run_on_ui_thread(self.on_import_scan_finished, image_paths, source, root_map, error_text)
+
+    def build_source_root_map(self, image_paths: list[Path], import_paths: list[Path]) -> dict[Path, Path]:
+        roots: list[Path] = []
+        for path in import_paths:
+            try:
+                roots.append(path.resolve() if path.is_dir() else path.resolve().parent)
+            except OSError:
+                continue
+
+        root_map: dict[Path, Path] = {}
+        for image_path in image_paths:
+            try:
+                resolved = image_path.resolve()
+            except OSError:
+                continue
+            for root in roots:
+                try:
+                    resolved.relative_to(root)
+                except ValueError:
+                    continue
+                root_map[resolved] = root
+                break
+            else:
+                root_map[resolved] = resolved.parent
+        return root_map
 
     def on_import_scan_finished(
         self,
         image_paths: list[Path],
         source: str,
+        root_map: dict[Path, Path] | None = None,
         error_text: str | None = None,
     ) -> None:
         self.scanning = False
@@ -975,14 +1054,14 @@ class ImageToolApp:
             return
 
         before = len(self.files)
-        self.add_paths(image_paths)
+        self.add_paths(image_paths, root_map)
         added = len(self.files) - before
         skipped = len(image_paths) - added
         self.status_text.set(f"扫描完成：新增 {added} 张")
         if skipped > 0:
             self.write_log(f"{source}完成：新增 {added} 张，跳过重复 {skipped} 张。")
 
-    def add_paths(self, paths: list[Path]) -> None:
+    def add_paths(self, paths: list[Path], root_map: dict[Path, Path] | None = None) -> None:
         before = len(self.files)
         known = {path.resolve() for path in self.files}
         add_as_checked = self.select_all_var.get()
@@ -994,6 +1073,10 @@ class ImageToolApp:
                 if resolved in known:
                     continue
                 self.files.append(resolved)
+                if root_map and resolved in root_map:
+                    self.source_roots[resolved] = root_map[resolved]
+                else:
+                    self.source_roots[resolved] = resolved.parent
                 if add_as_checked:
                     self.checked_paths.add(resolved)
                 known.add(resolved)
@@ -1012,6 +1095,7 @@ class ImageToolApp:
         self.cancel_preview_update()
         self.files.clear()
         self.checked_paths.clear()
+        self.source_roots.clear()
         self.set_select_all_value(False)
         self.selected_image_size = None
         self.preview_image = None
@@ -1062,6 +1146,14 @@ class ImageToolApp:
     def selected_files(self) -> list[Path]:
         return [path for path in self.files if path in self.checked_paths]
 
+    def output_naming_for(self, source: Path, sequence: int | None = None) -> OutputNaming:
+        return OutputNaming(
+            template=self.naming_template.get().strip(),
+            preserve_structure=self.preserve_structure.get(),
+            source_root=self.source_roots.get(source, source.parent),
+            sequence=sequence,
+        )
+
     def toggle_file_check(self, iid: str) -> None:
         path = self.path_from_iid(iid)
         if path is None:
@@ -1087,6 +1179,7 @@ class ImageToolApp:
 
         self.files.remove(path)
         self.checked_paths.discard(path)
+        self.source_roots.pop(path, None)
         self.selected_image_size = None
         self.refresh_file_list()
         self.write_log(f"已从列表删除：{path.name}")
@@ -1147,10 +1240,14 @@ class ImageToolApp:
             save_config(
                 {
                     "output_dir": self.output_dir.get().strip(),
+                    "naming_template": self.naming_template.get().strip(),
+                    "preserve_structure": self.preserve_structure.get(),
+                    "keep_metadata": self.keep_metadata.get(),
                     "include_subfolders": self.include_subfolders.get(),
                     "log_dir": self.log_dir.get().strip(),
                     "operation_mode": self.operation_mode.get(),
                     "compression_level": self.compression_level.get(),
+                    "target_size_kb": self.target_size_kb.get(),
                     "transparency_tolerance": self.transparency_tolerance.get(),
                     "transparency_edge_cleanup": self.transparency_edge_cleanup.get(),
                     "target_format": self.target_format.get(),
@@ -1191,6 +1288,9 @@ class ImageToolApp:
         dialog.configure(bg=self.colors["bg"])
 
         output_var = tk.StringVar(value=self.output_dir.get())
+        template_var = tk.StringVar(value=self.naming_template.get())
+        preserve_var = tk.BooleanVar(value=self.preserve_structure.get())
+        metadata_var = tk.BooleanVar(value=self.keep_metadata.get())
         include_var = tk.BooleanVar(value=self.include_subfolders.get())
         log_dir_var = tk.StringVar(value=self.log_dir.get())
 
@@ -1222,33 +1322,57 @@ class ImageToolApp:
             style="Muted.TLabel",
         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
-        ttk.Label(body, text="日志目录", style="PanelText.TLabel").grid(
+        ttk.Label(body, text="输出命名模板", style="PanelText.TLabel").grid(
             row=4, column=0, sticky="w", pady=(18, 8)
         )
+        ttk.Entry(body, textvariable=template_var, width=58).grid(
+            row=5, column=0, columnspan=3, sticky="ew", padx=(0, 10)
+        )
+        ttk.Label(
+            body,
+            text="留空沿用默认命名；可用 {name}、{operation}、{width}、{height}、{format}、{date}、{time}、{index}。",
+            style="Muted.TLabel",
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        ttk.Checkbutton(
+            body,
+            text="保留导入文件夹的子目录结构",
+            variable=preserve_var,
+        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(16, 0))
+
+        ttk.Checkbutton(
+            body,
+            text="保留图片元数据（EXIF/ICC/DPI）",
+            variable=metadata_var,
+        ).grid(row=8, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+        ttk.Label(body, text="日志目录", style="PanelText.TLabel").grid(
+            row=9, column=0, sticky="w", pady=(18, 8)
+        )
         ttk.Entry(body, textvariable=log_dir_var, width=58).grid(
-            row=5, column=0, columnspan=2, sticky="ew", padx=(0, 10)
+            row=10, column=0, columnspan=2, sticky="ew", padx=(0, 10)
         )
         ttk.Button(
             body,
             text="选择",
             style="Soft.TButton",
             command=lambda: self.choose_directory_for(log_dir_var, "选择日志目录", dialog),
-        ).grid(row=5, column=2, sticky="e")
+        ).grid(row=10, column=2, sticky="e")
 
         ttk.Label(
             body,
             text=f"当前日志文件：{middle_ellipsis(str(LOG_PATH), 78)}",
             style="Muted.TLabel",
-        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ).grid(row=11, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         ttk.Label(
             body,
             text=f"配置文件：{middle_ellipsis(str(CONFIG_PATH), 78)}",
             style="Muted.TLabel",
-        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ).grid(row=12, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         buttons = ttk.Frame(body, style="Panel.TFrame")
-        buttons.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(20, 0))
+        buttons.grid(row=13, column=0, columnspan=3, sticky="ew", pady=(20, 0))
         buttons.columnconfigure(0, weight=1)
 
         ttk.Button(
@@ -1259,9 +1383,17 @@ class ImageToolApp:
         ).grid(row=0, column=1, sticky="e", padx=(0, 10))
 
         def save_settings() -> None:
+            try:
+                validate_output_template(template_var.get())
+            except ValueError as exc:
+                messagebox.showerror("命名模板不可用", readable_error(exc), parent=dialog)
+                return
             if not self.apply_log_directory(log_dir_var.get()):
                 return
             self.output_dir.set(output_var.get().strip())
+            self.naming_template.set(template_var.get().strip())
+            self.preserve_structure.set(preserve_var.get())
+            self.keep_metadata.set(metadata_var.get())
             self.include_subfolders.set(include_var.get())
             if not self.save_current_config(announce=True):
                 return
@@ -1520,6 +1652,11 @@ class ImageToolApp:
             return False
         if self.validated_output_dir() is None:
             return False
+        try:
+            validate_output_template(self.naming_template.get())
+        except ValueError as exc:
+            messagebox.showwarning("命名模板不正确", readable_error(exc))
+            return False
         if self.operation_mode.get() == "convert":
             if self.target_format.get() not in SUPPORTED_EXPORT_FORMATS:
                 messagebox.showwarning("格式不正确", "请选择要转换到的输出格式。")
@@ -1531,6 +1668,14 @@ class ImageToolApp:
         if self.operation_mode.get() == "compress":
             if self.compression_level.get() not in COMPRESSION_LEVELS:
                 messagebox.showwarning("档位不正确", "请选择轻度、中度或重度压缩。")
+                return False
+            try:
+                target_size_kb = int(self.target_size_kb.get())
+            except (tk.TclError, ValueError):
+                messagebox.showwarning("目标体积不正确", "目标体积需要是 0 或正整数 KB。")
+                return False
+            if target_size_kb < 0:
+                messagebox.showwarning("目标体积不正确", "目标体积需要是 0 或正整数 KB。")
                 return False
             return True
         if self.operation_mode.get() == "transparent":
@@ -1561,6 +1706,14 @@ class ImageToolApp:
             return False
         return True
 
+    def cancel_processing(self) -> None:
+        if not self.processing or self.cancel_requested.is_set():
+            return
+        self.cancel_requested.set()
+        self.status_text.set("正在取消，当前图片处理完成后停止...")
+        self.write_log("已请求取消任务，当前图片处理完成后停止。")
+        self.cancel_button.configure(state=tk.DISABLED)
+
     def start_processing(self) -> None:
         if not self.validate_before_processing():
             return
@@ -1570,16 +1723,25 @@ class ImageToolApp:
         target_format = self.target_format.get()
         coe_pixel_format = self.coe_pixel_format.get()
         compression_level = self.compression_level.get()
+        mode = self.operation_mode.get()
+        target_size_kb = int(self.target_size_kb.get()) if mode == "compress" else 0
+        target_bytes = target_size_kb * 1024 if target_size_kb > 0 else None
+        keep_metadata = self.keep_metadata.get()
         transparency_tolerance = self.transparency_tolerance.get()
         transparency_edge_cleanup = self.transparency_edge_cleanup.get()
-        mode = self.operation_mode.get()
         percent = int(self.percent.get()) if mode == "resize" else 0
 
         if mode == "transform":
             path = self.selected_preview_path()
             if path is not None:
                 try:
-                    CropRotateEditor(self, path, output_dir)
+                    CropRotateEditor(
+                        self,
+                        path,
+                        output_dir,
+                        naming=self.output_naming_for(path),
+                        keep_metadata=keep_metadata,
+                    )
                 except Exception as exc:
                     logger.exception("打开裁切/旋转编辑器失败：%s", path)
                     self.write_log(f"打开裁切/旋转失败 {path}: {readable_error(exc)}")
@@ -1590,21 +1752,23 @@ class ImageToolApp:
             return
 
         self.processing = True
+        self.cancel_requested.clear()
         self.start_button.configure(state=tk.DISABLED)
+        self.cancel_button.configure(state=tk.NORMAL)
         self.progress.configure(maximum=len(files), value=0)
         self.status_text.set("正在处理...")
         if mode == "convert":
             self.write_log(f"开始转换图片为 {target_format.upper()}。")
             thread = threading.Thread(
                 target=self.process_conversion_files,
-                args=(files, output_dir, target_format, coe_pixel_format),
+                args=(files, output_dir, target_format, coe_pixel_format, keep_metadata),
                 daemon=True,
             )
         elif mode == "compress":
             self.write_log(f"开始体积压缩图片，档位：{compression_level}。")
             thread = threading.Thread(
                 target=self.process_compression_files,
-                args=(files, output_dir, compression_level),
+                args=(files, output_dir, compression_level, target_bytes, keep_metadata),
                 daemon=True,
             )
         elif mode == "transparent":
@@ -1614,14 +1778,14 @@ class ImageToolApp:
             )
             thread = threading.Thread(
                 target=self.process_transparency_files,
-                args=(files, output_dir, transparency_tolerance, transparency_edge_cleanup),
+                args=(files, output_dir, transparency_tolerance, transparency_edge_cleanup, keep_metadata),
                 daemon=True,
             )
         else:
             self.write_log("开始压缩图片。")
             thread = threading.Thread(
                 target=self.process_files,
-                args=(files, output_dir, percent),
+                args=(files, output_dir, percent, keep_metadata),
                 daemon=True,
             )
 
@@ -1630,6 +1794,7 @@ class ImageToolApp:
         except Exception as exc:
             self.processing = False
             self.start_button.configure(state=tk.NORMAL)
+            self.cancel_button.configure(state=tk.DISABLED)
             self.status_text.set("任务启动失败")
             self.write_log(f"任务启动失败：{readable_error(exc)}")
             logger.exception("任务启动失败")
@@ -1659,15 +1824,31 @@ class ImageToolApp:
             )
         return confirmed
 
-    def process_files(self, files: list[Path], output_dir: Path, percent: int) -> None:
+    def process_files(
+        self,
+        files: list[Path],
+        output_dir: Path,
+        percent: int,
+        keep_metadata: bool,
+    ) -> None:
         success = 0
         failed = 0
+        cancelled = False
 
         for index, source in enumerate(files, start=1):
             if self.closing:
                 return
+            if self.cancel_requested.is_set():
+                cancelled = True
+                break
             try:
-                result = resize_image_file(source, output_dir, percent)
+                result = resize_image_file(
+                    source,
+                    output_dir,
+                    percent,
+                    naming=self.output_naming_for(source, index),
+                    keep_metadata=keep_metadata,
+                )
                 success += 1
                 message = (
                     f"完成 {source.name}: "
@@ -1681,7 +1862,8 @@ class ImageToolApp:
 
             self.run_on_ui_thread(self.on_file_processed, index, message)
 
-        self.run_on_ui_thread(self.on_processing_finished, success, failed)
+        cancelled = cancelled or self.cancel_requested.is_set()
+        self.run_on_ui_thread(self.on_processing_finished, success, failed, "压缩", cancelled)
 
     def process_conversion_files(
         self,
@@ -1689,15 +1871,27 @@ class ImageToolApp:
         output_dir: Path,
         target_format: str,
         coe_pixel_format: str,
+        keep_metadata: bool,
     ) -> None:
         success = 0
         failed = 0
+        cancelled = False
 
         for index, source in enumerate(files, start=1):
             if self.closing:
                 return
+            if self.cancel_requested.is_set():
+                cancelled = True
+                break
             try:
-                result = convert_image_file(source, output_dir, target_format, coe_pixel_format)
+                result = convert_image_file(
+                    source,
+                    output_dir,
+                    target_format,
+                    coe_pixel_format,
+                    naming=self.output_naming_for(source, index),
+                    keep_metadata=keep_metadata,
+                )
                 success += 1
                 message = (
                     f"完成 {source.name}: 转换为 {result.target_format.upper()}，"
@@ -1710,24 +1904,43 @@ class ImageToolApp:
 
             self.run_on_ui_thread(self.on_file_processed, index, message)
 
-        self.run_on_ui_thread(self.on_processing_finished, success, failed, "转换")
+        cancelled = cancelled or self.cancel_requested.is_set()
+        self.run_on_ui_thread(self.on_processing_finished, success, failed, "转换", cancelled)
 
     def process_compression_files(
         self,
         files: list[Path],
         output_dir: Path,
         level: str,
+        target_bytes: int | None,
+        keep_metadata: bool,
     ) -> None:
         success = 0
         failed = 0
+        cancelled = False
 
         for index, source in enumerate(files, start=1):
             if self.closing:
                 return
+            if self.cancel_requested.is_set():
+                cancelled = True
+                break
             try:
-                result = compress_image_file(source, output_dir, level)
+                result = compress_image_file(
+                    source,
+                    output_dir,
+                    level,
+                    target_bytes=target_bytes,
+                    naming=self.output_naming_for(source, index),
+                    keep_metadata=keep_metadata,
+                )
                 success += 1
-                if result.used_original_copy:
+                if result.target_bytes is not None:
+                    if result.target_size_reached:
+                        change_text = f"已达目标 {result.target_bytes / 1024:.0f}KB"
+                    else:
+                        change_text = f"未能低于目标 {result.target_bytes / 1024:.0f}KB，已输出可达到的最小结果"
+                elif result.used_original_copy:
                     change_text = "原图已是更优体积，已复制原图"
                 else:
                     change_text = f"节省 {result.saved_percent:.1f}%"
@@ -1742,7 +1955,8 @@ class ImageToolApp:
 
             self.run_on_ui_thread(self.on_file_processed, index, message)
 
-        self.run_on_ui_thread(self.on_processing_finished, success, failed, "体积压缩")
+        cancelled = cancelled or self.cancel_requested.is_set()
+        self.run_on_ui_thread(self.on_processing_finished, success, failed, "体积压缩", cancelled)
 
     def process_transparency_files(
         self,
@@ -1750,15 +1964,27 @@ class ImageToolApp:
         output_dir: Path,
         tolerance: int,
         edge_cleanup: str,
+        keep_metadata: bool,
     ) -> None:
         success = 0
         failed = 0
+        cancelled = False
 
         for index, source in enumerate(files, start=1):
             if self.closing:
                 return
+            if self.cancel_requested.is_set():
+                cancelled = True
+                break
             try:
-                result = create_transparent_image_file(source, output_dir, tolerance, edge_cleanup)
+                result = create_transparent_image_file(
+                    source,
+                    output_dir,
+                    tolerance,
+                    edge_cleanup,
+                    naming=self.output_naming_for(source, index),
+                    keep_metadata=keep_metadata,
+                )
                 success += 1
                 red, green, blue = result.background_color
                 message = (
@@ -1774,7 +2000,8 @@ class ImageToolApp:
 
             self.run_on_ui_thread(self.on_file_processed, index, message)
 
-        self.run_on_ui_thread(self.on_processing_finished, success, failed, "生成透明图片")
+        cancelled = cancelled or self.cancel_requested.is_set()
+        self.run_on_ui_thread(self.on_processing_finished, success, failed, "生成透明图片", cancelled)
 
     def on_file_processed(self, progress_value: int, message: str) -> None:
         if self.closing:
@@ -1782,11 +2009,23 @@ class ImageToolApp:
         self.progress.configure(value=progress_value)
         self.write_log(message)
 
-    def on_processing_finished(self, success: int, failed: int, operation: str = "压缩") -> None:
+    def on_processing_finished(
+        self,
+        success: int,
+        failed: int,
+        operation: str = "压缩",
+        cancelled: bool = False,
+    ) -> None:
         if self.closing:
             return
         self.processing = False
         self.start_button.configure(state=tk.NORMAL)
+        self.cancel_button.configure(state=tk.DISABLED)
+        self.cancel_requested.clear()
+        if cancelled:
+            self.status_text.set(f"已取消：成功 {success}，失败 {failed}")
+            self.write_log(f"任务已取消：成功 {success} 张，失败 {failed} 张。")
+            return
         self.status_text.set(f"完成：成功 {success}，失败 {failed}")
         self.write_log(f"处理结束：成功 {success} 张，失败 {failed} 张。")
         if success:

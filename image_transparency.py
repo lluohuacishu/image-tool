@@ -6,10 +6,13 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
+from output_naming import OutputNaming, build_output_path
+from output_safety import commit_temporary_output, remove_file_silently, temporary_output_path
+
 
 MAX_BACKGROUND_COLORS = 4
 BACKGROUND_GROUP_MIN_SHARE = 0.05
-MAX_TRANSPARENCY_IMAGE_PIXELS = 90_000_000
+MAX_TRANSPARENCY_IMAGE_PIXELS = 60_000_000
 MIN_BACKGROUND_COMPONENT_AREA = 8
 MAX_OPAQUE_ISLAND_AREA = 32
 DEFAULT_EDGE_CLEANUP = "中度"
@@ -591,20 +594,48 @@ def create_transparent_image_file(
     output_dir: Path,
     tolerance: int,
     edge_cleanup: str = DEFAULT_EDGE_CLEANUP,
+    naming: OutputNaming | None = None,
+    keep_metadata: bool = False,
 ) -> TransparencyResult:
     if tolerance < 1 or tolerance > 100:
         raise ValueError("透明背景容差需要在 1 到 100 之间")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    target = unique_transparent_path(output_dir, source)
+    target = output_dir / f"{source.stem}_transparent.png"
+    temp_target: Path | None = None
     cleanup_name, _settings = resolve_edge_cleanup_settings(edge_cleanup)
 
-    with Image.open(source) as opened:
-        ensure_transparency_pixel_limit(opened.size)
-        image = ImageOps.exif_transpose(opened)
-        original_size = image.size
-        transparent, background = make_background_transparent(image, tolerance, cleanup_name)
-        transparent.save(target, format="PNG", optimize=True)
+    try:
+        with Image.open(source) as opened:
+            ensure_transparency_pixel_limit(opened.size)
+            image = ImageOps.exif_transpose(opened)
+            original_size = image.size
+            transparent, background = make_background_transparent(image, tolerance, cleanup_name)
+            target = build_output_path(
+                output_dir,
+                source,
+                ".png",
+                "transparent",
+                "png",
+                transparent.size,
+                naming,
+                f"{source.stem}_transparent",
+            )
+            temp_target = temporary_output_path(target)
+            save_kwargs: dict[str, object] = {"optimize": True}
+            if keep_metadata:
+                exif = image.getexif()
+                if exif:
+                    save_kwargs["exif"] = exif.tobytes()
+                for key in ("icc_profile", "dpi"):
+                    if key in image.info:
+                        save_kwargs[key] = image.info[key]
+            transparent.save(temp_target, format="PNG", **save_kwargs)
+
+        target = commit_temporary_output(temp_target, target)
+    except Exception:
+        if temp_target is not None:
+            remove_file_silently(temp_target)
+        raise
 
     return TransparencyResult(
         source=source,

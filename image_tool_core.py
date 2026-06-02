@@ -8,12 +8,15 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
-from image_conversion import prepare_for_jpeg
+from image_conversion import copy_metadata_info, prepare_for_format, save_regular_image
+from output_naming import OutputNaming, build_output_path
+from output_safety import commit_temporary_output, remove_file_silently, temporary_output_path
 
 
-MAX_SAFE_IMAGE_PIXELS = 500_000_000
-MAX_PREVIEW_IMAGE_PIXELS = 160_000_000
-MAX_INTERACTIVE_IMAGE_PIXELS = 120_000_000
+MAX_SAFE_IMAGE_PIXELS = 150_000_000
+MAX_PREVIEW_IMAGE_PIXELS = 80_000_000
+MAX_INTERACTIVE_IMAGE_PIXELS = 80_000_000
+MAX_IMPORTED_IMAGE_FILES = 10_000
 IMAGE_EXTENSIONS = {
     ".jpg",
     ".jpeg",
@@ -40,6 +43,28 @@ warnings.simplefilter("error", Image.DecompressionBombWarning)
 
 logger = logging.getLogger("image_tool_gui")
 
+RESIZE_FORMAT_ALIASES = {
+    "jfif": "jpg",
+    "dib": "bmp",
+    "pgm": "ppm",
+    "pbm": "ppm",
+    "pnm": "ppm",
+}
+
+RESIZE_EXPORT_FORMATS = {
+    "png",
+    "jpg",
+    "jpeg",
+    "webp",
+    "bmp",
+    "tif",
+    "tiff",
+    "ico",
+    "gif",
+    "ppm",
+    "tga",
+}
+
 
 @dataclass(frozen=True)
 class ResizeResult:
@@ -57,17 +82,29 @@ def is_image_file(path: Path) -> bool:
         return False
 
 
-def collect_image_paths(paths: list[Path], include_subfolders: bool) -> list[Path]:
+def collect_image_paths(
+    paths: list[Path],
+    include_subfolders: bool,
+    max_images: int | None = None,
+) -> list[Path]:
     images: list[Path] = []
+
+    def append_image(image_path: Path) -> None:
+        if max_images is not None and len(images) >= max_images:
+            raise ValueError(
+                f"一次最多导入 {max_images:,} 张图片，请缩小文件夹范围或关闭子文件夹扫描。"
+            )
+        images.append(image_path)
+
     for path in paths:
         try:
             if path.is_dir():
                 iterator = path.rglob("*") if include_subfolders else path.iterdir()
                 for candidate in iterator:
                     if is_image_file(candidate):
-                        images.append(candidate)
+                        append_image(candidate)
             elif is_image_file(path):
-                images.append(path)
+                append_image(path)
         except OSError:
             logger.warning("扫描路径失败：%s", path, exc_info=True)
     return images
@@ -110,8 +147,24 @@ def ensure_image_pixel_limit(
         )
 
 
+def resize_target_format_from_source(source: Path) -> str:
+    suffix = source.suffix.lower().lstrip(".")
+    target_format = RESIZE_FORMAT_ALIASES.get(suffix, suffix)
+    if target_format not in RESIZE_EXPORT_FORMATS:
+        return "png"
+    return target_format
+
+
+def resize_target_suffix(source: Path) -> str:
+    target_format = resize_target_format_from_source(source)
+    source_suffix = source.suffix.lower()
+    if target_format == source_suffix.lstrip("."):
+        return source_suffix
+    return f".{target_format}"
+
+
 def unique_output_path(output_dir: Path, source: Path, percent: int) -> Path:
-    suffix = source.suffix.lower()
+    suffix = resize_target_suffix(source)
     base_name = f"{source.stem}_{percent}pct"
     candidate = output_dir / f"{base_name}{suffix}"
     index = 2
@@ -147,34 +200,52 @@ def load_preview_image(path: Path, max_size: tuple[int, int]) -> tuple[Image.Ima
         return preview.copy(), original_size
 
 
-def resize_image_file(source: Path, output_dir: Path, percent: int) -> ResizeResult:
+def resize_image_file(
+    source: Path,
+    output_dir: Path,
+    percent: int,
+    naming: OutputNaming | None = None,
+    keep_metadata: bool = False,
+) -> ResizeResult:
     if percent < 1 or percent > 100:
         raise ValueError("缩放比例需要在 1 到 100 之间")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    target = unique_output_path(output_dir, source, percent)
+    target = output_dir / f"{source.stem}{resize_target_suffix(source)}"
+    temp_target: Path | None = None
 
-    with Image.open(source) as opened:
-        original_size = oriented_size(opened)
-        ensure_image_pixel_limit(original_size, MAX_SAFE_IMAGE_PIXELS, "处理")
-        original = ImageOps.exif_transpose(opened)
-        original_size = original.size
-        new_size = (
-            max(1, math.floor(original.width * percent / 100)),
-            max(1, math.floor(original.height * percent / 100)),
-        )
-        resized = original.resize(new_size, Image.Resampling.LANCZOS)
+    try:
+        with Image.open(source) as opened:
+            original_size = oriented_size(opened)
+            ensure_image_pixel_limit(original_size, MAX_SAFE_IMAGE_PIXELS, "处理")
+            original = ImageOps.exif_transpose(opened)
+            original_size = original.size
+            new_size = (
+                max(1, math.floor(original.width * percent / 100)),
+                max(1, math.floor(original.height * percent / 100)),
+            )
+            resized = original.resize(new_size, Image.Resampling.LANCZOS)
 
-        save_kwargs: dict[str, object] = {}
-        suffix = target.suffix.lower()
-        if suffix in {".jpg", ".jpeg"}:
-            resized = prepare_for_jpeg(resized)
-            save_kwargs.update({"quality": 92, "optimize": True, "progressive": True})
-        elif suffix == ".png":
-            save_kwargs.update({"optimize": True})
-        elif suffix == ".webp":
-            save_kwargs.update({"quality": 92, "method": 6})
+            target_format = resize_target_format_from_source(source)
+            suffix = resize_target_suffix(source)
+            target = build_output_path(
+                output_dir,
+                source,
+                suffix,
+                f"{percent}pct",
+                target_format,
+                new_size,
+                naming,
+                f"{source.stem}_{percent}pct",
+            )
+            temp_target = temporary_output_path(target)
+            resized = prepare_for_format(resized, target_format)
+            copy_metadata_info(resized, original)
+            save_regular_image(resized, temp_target, target_format, keep_metadata)
 
-        resized.save(target, **save_kwargs)
+        target = commit_temporary_output(temp_target, target)
+    except Exception:
+        if temp_target is not None:
+            remove_file_silently(temp_target)
+        raise
 
     return ResizeResult(source, target, original_size, new_size)
