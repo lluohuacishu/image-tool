@@ -1,6 +1,6 @@
 # 图片处理工具
 
-一个基于 Python Tkinter 和 Pillow 的桌面图片处理工具，支持批量处理图片。当前主要面向 Windows 使用，也可以直接用 Python 源码运行。release上传的时候忘给exe改名了（悲）。
+一个基于 Python Tkinter 和 Pillow 的桌面图片处理工具，支持批量处理图片。当前主要面向 Windows 使用，也可以直接用 Python 源码运行。
 
 ## 功能
 
