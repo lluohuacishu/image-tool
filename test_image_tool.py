@@ -14,7 +14,13 @@ from image_tool_core import (
     resize_target_format_from_source,
     resize_target_suffix,
 )
-from output_naming import OutputNaming, validate_output_template
+from output_naming import (
+    DEFAULT_NAMING_TEMPLATE,
+    MAX_TEMPLATE_CHARS,
+    OutputNaming,
+    default_template_from_config,
+    validate_output_template,
+)
 from output_safety import commit_temporary_output, temporary_output_path
 
 
@@ -107,6 +113,23 @@ class ImageToolCoreTests(unittest.TestCase):
     def test_validate_output_template_rejects_unknown_fields(self) -> None:
         with self.assertRaises(ValueError):
             validate_output_template("{name}_{unknown}")
+        with self.assertRaises(ValueError):
+            validate_output_template("{name.__class__}")
+        with self.assertRaises(ValueError):
+            validate_output_template("{date:>100000}")
+
+    def test_default_template_from_config_uses_readable_timestamp_template(self) -> None:
+        self.assertEqual(default_template_from_config(""), DEFAULT_NAMING_TEMPLATE)
+        self.assertEqual(default_template_from_config("   "), DEFAULT_NAMING_TEMPLATE)
+        self.assertEqual(
+            default_template_from_config("x" * (MAX_TEMPLATE_CHARS + 1)),
+            DEFAULT_NAMING_TEMPLATE,
+        )
+        self.assertEqual(default_template_from_config("{name.__class__}"), DEFAULT_NAMING_TEMPLATE)
+
+    def test_validate_output_template_rejects_overlong_templates(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_output_template("x" * (MAX_TEMPLATE_CHARS + 1))
 
     def test_target_size_compression_reports_reached_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

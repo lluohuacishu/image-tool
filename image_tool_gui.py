@@ -32,7 +32,7 @@ from image_tool_core import (
     readable_error,
     resize_image_file,
 )
-from output_naming import OutputNaming, validate_output_template
+from output_naming import DEFAULT_NAMING_TEMPLATE, OutputNaming, default_template_from_config, validate_output_template
 from image_transparency import EDGE_CLEANUP_LEVELS, create_transparent_image_file
 
 
@@ -163,7 +163,9 @@ class ImageToolApp:
         self.checked_paths: set[Path] = set()
         self.source_roots: dict[Path, Path] = {}
         self.output_dir = tk.StringVar(value=str(self.config.get("output_dir", "")))
-        self.naming_template = tk.StringVar(value=str(self.config.get("naming_template", "")))
+        self.naming_template = tk.StringVar(
+            value=default_template_from_config(self.config.get("naming_template"))
+        )
         self.preserve_structure = tk.BooleanVar(
             value=bool(self.config.get("preserve_structure", False))
         )
@@ -1151,7 +1153,7 @@ class ImageToolApp:
             template=self.naming_template.get().strip(),
             preserve_structure=self.preserve_structure.get(),
             source_root=self.source_roots.get(source, source.parent),
-            sequence=sequence,
+            sequence=sequence or 1,
         )
 
     def toggle_file_check(self, iid: str) -> None:
@@ -1330,8 +1332,13 @@ class ImageToolApp:
         )
         ttk.Label(
             body,
-            text="留空沿用默认命名；可用 {name}、{operation}、{width}、{height}、{format}、{date}、{time}、{index}。",
+            text=(
+                f"默认：{DEFAULT_NAMING_TEMPLATE}\n"
+                "{date}=日期，{time}=时间，{index}=本次处理序号，{operation}=处理方式，"
+                "{width}/{height}=输出宽高，{format}=输出格式，{ext}=原扩展名，{name}=原文件名。"
+            ),
             style="Muted.TLabel",
+            wraplength=620,
         ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         ttk.Checkbutton(
@@ -1391,7 +1398,7 @@ class ImageToolApp:
             if not self.apply_log_directory(log_dir_var.get()):
                 return
             self.output_dir.set(output_var.get().strip())
-            self.naming_template.set(template_var.get().strip())
+            self.naming_template.set(template_var.get().strip() or DEFAULT_NAMING_TEMPLATE)
             self.preserve_structure.set(preserve_var.get())
             self.keep_metadata.set(metadata_var.get())
             self.include_subfolders.set(include_var.get())
